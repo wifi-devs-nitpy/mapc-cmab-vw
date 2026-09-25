@@ -185,3 +185,7 @@ jax_cache
 
 #json files 
 **/*.json
+
+
+**/*.pem
+**/*.pub 
