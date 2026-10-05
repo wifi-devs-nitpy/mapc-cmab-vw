@@ -6,72 +6,78 @@ import numpy as np
 from chex import Array
 
 from mapc_cmab_vw.agents.mapc_agent import MapcAgent
+from mapc_cmab_vw.agents.vw_contextual_bandit import VwCBAgent
 
 
-class HierarchicalMapcVwCB(MapcAgent):
+class HierarchicalMapcVWAgent(MapcAgent):
     """
-    Hierarchical MAPC agent using Vowpal Wabbit contextual-bandit agents.
+    Hierarchical contextual-bandit agent (Vowpal Wabbit backend) responsible for the
+    selection of the AP / station / link / tx-power configuration.
 
-    Hierarchy:
-      Level 1: decide which APs participate.
-      Level 2: each selected AP chooses a station (relative station index).
-      Level 3: each selected AP chooses a non-empty link combination.
-      Level 4: each selected (station, link) chooses a TX-power index.
+    Identical in structure to ``HierarchicalMapcDQNAgent``:
 
-    IMPORTANT:
-    Every VwCBAgent exposes actions using the same 0-based convention as DQN.
-    The 0-based -> 1-based conversion is internal to VwCBAgent only.
-    Therefore this class contains no VW-specific +1/-1 action arithmetic.
+      1. Each non-sharing AP decides whether it joins the group (binary action).
+      2. Each AP in the group selects the (relative) index of the station it serves.
+      3. Each AP in the group selects a link combination (index into link_comb_index_to_links).
+      4. Each (station, link) pair selects a transmission power index.
+
+    INDEXING CONVENTION
+    -------------------
+    * Everything is 0-based, exactly as in the DQN agent.
+    * ``VwCBAgent`` already exposes 0-based actions; the 0-based <-> VW 1-based
+      conversion is isolated inside the wrapper (applied only when the VW learn
+      example is built). This class therefore performs NO index shifting.
+    * ``_sample`` only validates that the returned action is within 0..K-1, so a
+      convention mismatch fails immediately instead of silently wrapping around
+      (e.g. -1 indexing the last element).
+    * The wrapper stores its own previous action, so the ``*_last_action`` dicts are
+      not passed to the agents; they are still maintained (0-based) so logging and
+      inspection match the DQN agent.
+
+    Reward bookkeeping is unchanged: ``self.rewards[last_step[agent]]`` is the (1-step
+    delayed) reward belonging to the action the agent took when it was last sampled.
     """
 
     def __init__(
-        self,
-        associations: dict[int, list[int]],
-        find_groups_agent: dict[int, object],
-        assign_stations_agent: dict[int, object],
-        assign_links_agent: dict[int, object],
-        assign_tx_power_agent: dict[tuple[int, int], object],
-        encode_sharing_ap: Callable,
-        encode_ap_group: Callable,
-        encode_ap_stations_to_tx_vector: Callable,
-        encode_sta_links_vector: Callable,
-        link_comb_index_to_links: dict[int, list],
-        n_links: int,
-        n_tx_power_levels: int,
-        logger=None,
-    ):
-        self.associations = {
-            ap: np.asarray(stations) for ap, stations in associations.items()
-        }
-        self.inv_associations = {
-            sta: ap for ap in self.associations for sta in self.associations[ap]
-        }
+            self,
+            associations: dict[int, list[int]],
+            find_groups_agent: dict[int, VwCBAgent],
+            assign_stations_agent: dict[int, VwCBAgent],
+            assign_links_agent: dict[int, VwCBAgent],
+            assign_tx_power_agent: dict[tuple[int, int], VwCBAgent],
+            encode_sharing_ap: Callable,
+            encode_ap_group: Callable,
+            encode_ap_stations_to_tx_vector: Callable,
+            encode_sta_links_vector: Callable,
+            ap_group_action_to_ap_group: Callable,
+            link_comb_index_to_links: dict[int, list],
+            sta_index_mapping: dict[int, int],
+            n_links: int,
+            n_tx_power_levels: int,
+            logger=None
+        ):
 
+        self.associations = associations
+        self.inv_associations = {sta: ap for ap in associations.keys() for sta in associations[ap]}
         self.find_groups_agent = find_groups_agent
         self.assign_stations_agent = assign_stations_agent
         self.assign_links_agent = assign_links_agent
         self.assign_tx_power_agent = assign_tx_power_agent
+        self.ap_group_action_to_ap_group = ap_group_action_to_ap_group
+        self.link_comb_index_to_links = link_comb_index_to_links
+        self.sta_index_mapping = sta_index_mapping
+        self.n_links = n_links
+        self.logger = logger
 
         self.encoded_sharing_ap = encode_sharing_ap
         self.encode_ap_group = encode_ap_group
         self.encode_ap_stations_to_tx_vector = encode_ap_stations_to_tx_vector
         self.encode_sta_links_vector = encode_sta_links_vector
 
-        self.link_comb_index_to_links = link_comb_index_to_links
-        self.n_links = n_links
         self.n_tx_power_levels = n_tx_power_levels
-        self.logger = logger
 
-        self.access_points = np.asarray(list(self.associations.keys()))
-        self.stations = np.asarray(
-            list(chain.from_iterable(self.associations.values()))
-        )
-        self.n_ap = len(self.access_points)
-        self.n_sta = len(self.stations)
-        self.n_nodes = self.n_ap + self.n_sta
-        self.stations_per_ap = len(self.associations[self.access_points[0]])
-
-        # Per-agent delayed-transition bookkeeping.
+        # step at which an agent last acted (-> index of its delayed reward)
+        # last action is kept 0-based, same as in the DQN agent (bookkeeping only)
         self.find_groups_agent_last_step = defaultdict(int)
         self.find_groups_agent_last_action = defaultdict(int)
 
@@ -87,185 +93,154 @@ class HierarchicalMapcVwCB(MapcAgent):
         self.step = 0
         self.rewards = []
 
+        self.associations = {ap: np.array(stations) for ap, stations in associations.items()}
+        self.access_points = np.asarray(list(associations.keys()))
+        self.stations = np.asarray(list(chain.from_iterable(associations.values())))
+        self.n_nodes = len(self.access_points) + len(list(chain.from_iterable(associations.values())))
+        self.n_ap = len(associations.keys())
+
+    # ------------------------------------------------------------------ #
+    # Single point of contact with the VW wrapper
+    # ------------------------------------------------------------------ #
+    def _sample(self, agent: VwCBAgent, context: Array, last_step: int) -> int:
+        """
+        Learns from the delayed reward of the agent's previous action and returns the
+        new action as a 0-based index.
+
+        ``VwCBAgent.sample(context, previous_reward)`` internally
+          1. learns on (previous_context, previous_action, previous_reward),
+          2. predicts for the new context and returns a 0-based action.
+        """
+        previous_reward = float(self.rewards[last_step])
+        action = int(agent.sample(context, previous_reward))       # already 0..K-1
+        if not 0 <= action < agent.n_actions:
+            raise ValueError(
+                f"Agent returned action {action}, expected 0..{agent.n_actions - 1}"
+            )
+        return action
+
     def sample(self, reward) -> tuple[Array, Array]:
+        """
+        Samples the agent to the transmission matrix.
+
+        Returns
+        -------
+        tuple
+            The transmission matrices and tx_power indices (one per link).
+        """
+
         self.step += 1
         self.rewards.append(reward)
 
-        # ---------------------------------------------------------------
-        # LEVEL 1: choose a sharing AP + select the other participating APs
-        # ---------------------------------------------------------------
-        sharing_ap = int(np.random.choice(self.access_points))
-        sharing_sta = int(np.random.choice(self.associations[sharing_ap]))
+        # loop invariant: after the append, reward of step t sits at index t-1, so
+        # self.rewards[last_step[agent]] is the reward that followed the agent's last action.
 
+        sharing_ap = np.random.choice(self.access_points).item()
+        sharing_sta = np.random.choice(self.associations[sharing_ap]).item()
+
+        # ---------------- level 1: AP group ---------------- #
         context_lvl1 = self.encoded_sharing_ap(sharing_ap, sharing_sta)
 
-        find_groups_agent_action = np.zeros(
-            shape=self.access_points.shape,
-            dtype=np.int32,
-        )
-
-        # The DQN architecture represents AP participation as:
-        #   0 -> not participating
-        #   1 -> participating
-        # Keep this convention unchanged.
-        find_groups_agent_action[self.access_points == sharing_ap] = 1
+        # 1 -> AP participates, 0 -> AP does not (sharing AP always participates)
+        find_groups_agent_action = np.zeros(shape=self.access_points.shape, dtype=np.int32)
+        find_groups_agent_action[sharing_ap] = 1
 
         aps_taking_action = self.access_points[self.access_points != sharing_ap]
 
         for ap in aps_taking_action:
-            ap = int(ap)
-
-            action = self.find_groups_agent[ap].sample(
+            ap = ap.item()
+            action = self._sample(
+                self.find_groups_agent[ap],
                 context_lvl1,
-                self._previous_reward(
-                    self.find_groups_agent_last_step[ap]
-                ),
+                self.find_groups_agent_last_step[ap],
             )
             find_groups_agent_action[ap] = action
-
             self.find_groups_agent_last_action[ap] = action
             self.find_groups_agent_last_step[ap] = self.step
 
+        # ---------------- level 2: station assignment ---------------- #
         context_lvl2 = find_groups_agent_action
-        selected_aps = self.access_points[
-            context_lvl2.astype(bool)
-        ]
+        selected_aps = self.access_points[context_lvl2.astype(bool)]  # np.bool removed in NumPy>=1.24
+
         selected_ap_group = selected_aps[selected_aps != sharing_ap]
 
-        # ---------------------------------------------------------------
-        # LEVEL 2: each selected AP chooses one of its associated STAs
-        # ---------------------------------------------------------------
-        ap_sta_pairs = {}
-
-        for ap in selected_ap_group:
-            ap = int(ap)
-            action_size = len(self.associations[ap])
-
-            action = self.assign_stations_agent[ap].sample(
+        # relative index of the station in associations[ap] (0-based)
+        ap_sta_pairs = {
+            int(ap): self._sample(
+                self.assign_stations_agent[ap],
                 context_lvl2,
-                self._previous_reward(
-                    self.assign_stations_agent_last_step[ap]
-                ),
+                self.assign_stations_agent_last_step[ap],
             )
+            for ap in selected_ap_group
+        }
 
-            if not 0 <= action < action_size:
-                raise RuntimeError(
-                    f"Invalid level-2 action {action} for AP {ap}; "
-                    f"expected [0, {action_size - 1}]"
-                )
-
-            ap_sta_pairs[ap] = int(action)
+        for ap, sta_idx in ap_sta_pairs.items():
             self.assign_stations_agent_last_step[ap] = self.step
-            self.assign_stations_agent_last_action[ap] = int(action)
+            self.assign_stations_agent_last_action[ap] = sta_idx
 
-        # Sharing AP's station is fixed by the DCF/contention decision.
-        ap_sta_pairs[sharing_ap] = int(
-            np.argmax(self.associations[sharing_ap] == sharing_sta)
-        )
+        ap_sta_pairs[sharing_ap] = (self.associations[sharing_ap] == sharing_sta).argmax().item()
 
-        # ---------------------------------------------------------------
-        # LEVEL 3: choose link-combination for each selected AP
-        # ---------------------------------------------------------------
+        # ---------------- level 3: link combination ---------------- #
         context_lvl3 = self.encode_ap_stations_to_tx_vector(ap_sta_pairs)
 
-        ap_sta_links = {}
-
-        for ap in selected_aps:
-            ap = int(ap)
-
-            action = self.assign_links_agent[ap].sample(
+        # 0-based index into link_comb_index_to_links
+        ap_sta_links = {
+            int(ap): self._sample(
+                self.assign_links_agent[ap],
                 context_lvl3,
-                self._previous_reward(
-                    self.assign_links_agent_last_step[ap]
-                ),
+                self.assign_links_agent_last_step[ap],
             )
+            for ap in selected_aps
+        }
 
-            if not 0 <= action < len(self.link_comb_index_to_links):
-                raise RuntimeError(
-                    f"Invalid level-3 action {action} for AP {ap}"
-                )
-
-            ap_sta_links[ap] = int(action)
+        for ap, link_idx in ap_sta_links.items():
             self.assign_links_agent_last_step[ap] = self.step
-            self.assign_links_agent_last_action[ap] = int(action)
+            self.assign_links_agent_last_action[ap] = link_idx
 
-        # Convert relative AP -> STA link choice into STA -> link choice.
+        # ap -> sta
         sta_link_indices = {}
         for ap, link_idx in ap_sta_links.items():
-            sta_rel_idx = ap_sta_pairs[ap]
-            sta = int(self.associations[ap][sta_rel_idx])
-            sta_link_indices[sta] = link_idx
+            sta_selected_rel_index = ap_sta_pairs[ap]
+            sta_index = self.associations[ap][sta_selected_rel_index]
+            sta_link_indices[sta_index] = link_idx
 
-        # ---------------------------------------------------------------
-        # LEVEL 4: choose TX power for each active STA-link
-        # ---------------------------------------------------------------
+        # ---------------- level 4: tx power ---------------- #
         context_lvl4 = self.encode_sta_links_vector(sta_link_indices)
+
+        sta_links = {
+            sta: self.link_comb_index_to_links[link_index]
+            for sta, link_index in sta_link_indices.items()
+        }
 
         link_ap_sta = {
             link: {
-                "tx_matrix": np.zeros(
-                    (self.n_nodes, self.n_nodes), dtype=np.int16
-                ),
-                "tx_power_indices": np.zeros(
-                    self.n_nodes, dtype=np.int16
-                ),
+                "tx_matrix": np.zeros((self.n_nodes, self.n_nodes)),
+                "tx_power_indices": np.zeros(self.n_nodes, dtype=np.int32)
             }
             for link in range(self.n_links)
         }
 
-        for sta, links in (
-            (sta, self.link_comb_index_to_links[link_idx])
-            for sta, link_idx in sta_link_indices.items()
-        ):
+        for sta, links in sta_links.items():
             for link in links:
-                key = (sta, link)
-
-                action = self.assign_tx_power_agent[key].sample(
+                tx_power_index = self._sample(
+                    self.assign_tx_power_agent[sta, link],
                     context_lvl4,
-                    self._previous_reward(
-                        self.assign_tx_power_agent_last_step[key]
-                    ),
+                    self.assign_tx_power_agent_last_step[sta, link],
                 )
+                link_ap_sta[link]["tx_matrix"][self.inv_associations[sta], sta] = 1
+                link_ap_sta[link]["tx_power_indices"][self.inv_associations[sta]] = tx_power_index
+                self.assign_tx_power_agent_last_action[sta, link] = tx_power_index
+                self.assign_tx_power_agent_last_step[sta, link] = self.step
 
-                if not 0 <= action < self.n_tx_power_levels:
-                    raise RuntimeError(
-                        f"Invalid level-4 action {action} for "
-                        f"(STA={sta}, link={link})"
-                    )
-
-                ap = self.inv_associations[sta]
-
-                link_ap_sta[link]["tx_matrix"][ap, sta] = 1
-                link_ap_sta[link]["tx_power_indices"][ap] = action
-
-                self.assign_tx_power_agent_last_action[key] = int(action)
-                self.assign_tx_power_agent_last_step[key] = self.step
-
-        tx_matrices = np.asarray(
-            [link_ap_sta[r]["tx_matrix"] for r in range(self.n_links)],
-            dtype=np.int16,
-        )
-        tx_power_indices = np.asarray(
-            [link_ap_sta[r]["tx_power_indices"] for r in range(self.n_links)],
-            dtype=np.int16,
-        )
+        tx_matrices = np.array([link_ap_sta[r]["tx_matrix"] for r in range(self.n_links)], dtype=np.int16)
+        tx_power_indices = np.array([link_ap_sta[r]["tx_power_indices"] for r in range(self.n_links)], dtype=np.int16)
 
         if self.logger is not None:
             self.logger.log(
                 step=self.step,
                 tx_matrices=tx_matrices,
                 tx_power_indices=tx_power_indices,
-                reward=self.rewards[-1],
+                reward=self.rewards[-1],  # reward is 1 step delayed
             )
 
         return tx_matrices, tx_power_indices
-
-    def _previous_reward(self, last_step: int) -> float:
-        """
-        Existing simulator convention:
-        reward for action at `last_step` is stored at rewards[last_step].
-        A zero last_step means there is no real previous transition yet.
-        """
-        if last_step == 0:
-            return 0.0
-        return float(self.rewards[last_step])

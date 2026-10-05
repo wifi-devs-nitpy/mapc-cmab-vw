@@ -10,6 +10,11 @@ class VwCBAgent:
     Vowpal Wabbit's contextual-bandit action IDs are 1-based, so the conversion
     is isolated inside this wrapper:
         public/DQN action 0..K-1 <-> VW action 1..K
+
+    Exploration
+    -----------
+    The action is SAMPLED from VW's epsilon-greedy probability vector (not argmax'd),
+    and the probability of the sampled action is the one logged for learning.
     """
 
     def __init__(
@@ -97,11 +102,7 @@ class VwCBAgent:
 
     def sample(self, context, previous_reward):
         """
-        Match the existing hierarchical DQN/RLib calling convention:
-
-            action = agent.sample(
-                update_reward_from_previous_action
-            )
+        Match the existing hierarchical DQN/RLib calling convention.
 
         Context passed to sample() is the context for the NEW action.
         Reward belongs to the PREVIOUS action and is therefore used before
@@ -120,14 +121,17 @@ class VwCBAgent:
                 f"expected {(self.n_actions,)}"
             )
 
-        # Position in VW's probability vector is 0-based Python indexing.
-        public_action = int(np.argmax(action_probs))
+        # Normalise to guard against float drift (rng.choice requires sum == 1).
+        probs = action_probs / action_probs.sum()
 
-        # Store the public action. Conversion to VW's 1-based ID happens only
-        # when the learning example is constructed.
+        # Draw from VW's epsilon-greedy pmf: this is what creates exploration.
+        public_action = int(self.rng.choice(self.n_actions, p=probs))
+
+        # Store the public action and the probability of the action actually taken.
+        # Conversion to VW's 1-based ID happens only when the learn example is built.
         self.previous_context = context.copy()
         self.previous_action = public_action
-        self.previous_action_probability = float(action_probs[public_action])
+        self.previous_action_probability = float(probs[public_action])
         self.has_previous_action = True
 
         return public_action

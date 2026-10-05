@@ -176,6 +176,7 @@ pdfs
 **/send_run_status.py
 **/*.zip
 **/*.npy
+**/*.png
 **/*.html
 
 

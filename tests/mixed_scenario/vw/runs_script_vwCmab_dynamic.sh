@@ -17,9 +17,9 @@ exec > >(tee -a "$log_file") 2>&1
 echo "VW_CB DYnamic" 
 echo "Script execution started at - $(date) -"
 
-python vw_mixed_scenario.py --d-ap 10 --d-sta 2 --n-runs 50 --n-steps 20000 &  
-python vw_mixed_scenario.py --d-ap 20 --d-sta 2 --n-runs 50 --n-steps 20000 & 
-python vw_mixed_scenario.py --d-ap 30 --d-sta 2 --n-runs 50 --n-steps 20000 & 
+python vw_mixed_scenario.py --d-ap 10 --d-sta 2 --n-runs 5 --n-steps 3000 &  
+python vw_mixed_scenario.py --d-ap 20 --d-sta 2 --n-runs 5 --n-steps 3000 & 
+python vw_mixed_scenario.py --d-ap 30 --d-sta 2 --n-runs 5 --n-steps 3000 & 
 
 
 wait 
