@@ -1,7 +1,7 @@
 [project]
-name = "mapc-vwcb"
+name = "mapc-cmab-vw"
 version = "0.1.0"
-description = "Contextual bandits with vowpal wabbits"
+description = "Add your description here"
 readme = "README.md"
 authors = [
     { name = "devarshi-balu", email = "studious.devarshibalu@gmail.com" }
@@ -11,8 +11,8 @@ dependencies = [
     "chex>=0.1.91",
     "gymnasium>=1.2.3",
     "reinforced-lib>=2.0.4",
-    "vowpalwabbit",
     "tfp-nightly[jax]>=0.26.0.dev20260902",
+    "vowpalwabbit"
 ]
 
 [build-system]
