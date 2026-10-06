@@ -104,10 +104,11 @@ def parse_args():
 # independently later.
 # ---------------------------------------------------------------------------
 
-agent_params_lvl1 = {"epsilon": 0.30}
-agent_params_lvl2 = {"epsilon": 0.30}
-agent_params_lvl3 = {"epsilon": 0.10}
-agent_params_lvl4 = {"epsilon": 0.05}
+agent_params_lvl1 = {"epsilon": 0.05}
+agent_params_lvl2 = {"epsilon": 0.10}
+agent_params_lvl3 = {"epsilon": 0.02}
+agent_params_lvl4 = {"epsilon": 0.01}
+
 
 def create_agent_factory(scenario, args, seed):
     return MapcVWAgentFactory(
